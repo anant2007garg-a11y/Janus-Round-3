@@ -1,0 +1,139 @@
+#include <Arduino.h>
+#include <TinyGPSPlus.h>
+#include <SoftwareSerial.h>
+
+// ---------------- GPS SETUP ----------------
+// Pins for connecting the GPS module to Arduino
+#define RX_PIN 4  // GPS TX → Arduino RX
+#define TX_PIN 3  // GPS RX → Arduino TX (optional if module requires bidirectional comm)
+SoftwareSerial gpsSerial(RX_PIN, TX_PIN); // SoftwareSerial object to communicate with GPS
+TinyGPSPlus gps;                           // TinyGPS++ object to parse NMEA sentences
+
+// ---------------- FLIGHT STATE MACHINE ----------------
+// Enum defining all possible states of the CanSat
+enum State { IDLE, ASCENT, APOGEE, DESCENT, PAYLOAD_DEPLOYED, LANDED };
+State flightState = IDLE; // Start in IDLE (stationary on the ground)
+
+// ---------------- ALTITUDE TRACKING VARIABLES ----------------
+double currentAltitude = 0;    // Current altitude reading from GPS (meters)
+double previousAltitude = 0;   // Previous altitude reading for comparison
+double maxAltitude = 0;        // Maximum altitude reached (apogee)
+double groundAltitude = -1;    // Reference altitude at launch
+bool payloadDeployed = false;  // Flag to indicate if payload has been deployed
+
+// ---------------- STATE MACHINE LOGIC ----------------
+void updateState() {
+  static int descentCount = 0; // Counter used to detect stable descent (for apogee detection)
+
+  switch (flightState) {
+    case IDLE:
+      // Transition to ASCENT if altitude rises significantly above previous reading
+      if (currentAltitude > previousAltitude + 1.0) 
+        flightState = ASCENT;
+      break;
+
+    case ASCENT:
+      // Detect the start of descent → indicates apogee is near
+      if (currentAltitude < previousAltitude - 0.5) {
+        descentCount++;
+        // Confirm descent after 3 consecutive readings to avoid false triggers due to noise
+        if (descentCount >= 3) {
+          flightState = APOGEE; // Transition to APOGEE
+          descentCount = 0;     // Reset counter
+        }
+      } else {
+        descentCount = 0; // Reset counter if still ascending
+      }
+      break;
+
+    case APOGEE:
+      // Once apogee is reached, transition to descent
+      flightState = DESCENT;
+      break;
+
+    case DESCENT:
+      // Deploy payload when altitude drops below 75% of maximum altitude
+      if (!payloadDeployed && currentAltitude <= (0.75 * maxAltitude)) {
+        flightState = PAYLOAD_DEPLOYED;
+        payloadDeployed = true; // Mark payload as deployed
+      } 
+      // Detect landing when altitude is close to ground reference
+      else if (currentAltitude <= groundAltitude + 2) {
+        flightState = LANDED;
+      }
+      break;
+
+    case PAYLOAD_DEPLOYED:
+      // After payload deployment, continue monitoring for landing
+      if (currentAltitude <= groundAltitude + 2) 
+        flightState = LANDED;
+      break;
+
+    case LANDED:
+      // End state — CanSat has landed, no further action required
+      break;
+  }
+}
+
+// ---------------- TELEMETRY PRINT FUNCTION ----------------
+void printTelemetry() {
+  // Print current altitude
+  Serial.print("Alt (MSL): "); Serial.print(currentAltitude); Serial.print(" m | State: ");
+  
+  // Print current flight state as readable text
+  switch (flightState) {
+    case IDLE: Serial.println("IDLE"); break;
+    case ASCENT: Serial.println("ASCENT"); break;
+    case APOGEE: Serial.println("APOGEE"); break;
+    case DESCENT: Serial.println("DESCENT"); break;
+    case PAYLOAD_DEPLOYED: Serial.println("PAYLOAD DEPLOYED"); break;
+    case LANDED: Serial.println("LANDED"); break;
+  }
+
+  // Optional: print GPS coordinates if valid
+  if (gps.location.isValid()) {
+    Serial.print("Lat: "); Serial.print(gps.location.lat(), 6);
+    Serial.print(" | Lon: "); Serial.print(gps.location.lng(), 6);
+  }
+
+  // Optional: print GPS time if valid
+  if (gps.time.isValid()) {
+    Serial.print(" | Time: "); 
+    Serial.print(gps.time.hour()); Serial.print(":");
+    Serial.print(gps.time.minute()); Serial.print(":");
+    Serial.print(gps.time.second());
+  }
+  Serial.println();
+}
+
+// ---------------- ARDUINO SETUP ----------------
+void setup() {
+  Serial.begin(115200);       // Initialize serial monitor
+  gpsSerial.begin(9600);      // Initialize communication with GPS module
+  Serial.println("Starting CanSat GPS flight monitoring...");
+}
+
+// ---------------- ARDUINO LOOP ----------------
+void loop() {
+  // Read incoming data from GPS and feed to TinyGPS++ parser
+  while (gpsSerial.available() > 0) {
+    char c = gpsSerial.read();
+    gps.encode(c); // Parse GPS NMEA sentences
+  }
+
+  // Update altitude if a new valid GPS reading is available
+  if (gps.altitude.isUpdated() && gps.altitude.isValid()) {
+    previousAltitude = currentAltitude;
+    currentAltitude = gps.altitude.meters(); // Get altitude in meters
+
+    // Set ground reference altitude on first valid reading
+    if (groundAltitude < 0) groundAltitude = currentAltitude;
+
+    // Track maximum altitude (apogee)
+    if (currentAltitude > maxAltitude) maxAltitude = currentAltitude;
+
+    // Update flight state and print telemetry
+    updateState();
+    printTelemetry();
+  }
+}
